@@ -11,6 +11,8 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import zipfile
+import xml.etree.ElementTree as ET
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -37,10 +39,30 @@ def main():
     files = sorted(p for p in args.site.rglob("*") if p.is_file())
     if not files or not (args.site / "p2.index").is_file():
         parser.error("site must be an unpacked p2 repository containing p2.index")
-    expected = {coordinates(p.relative_to(args.site)) for p in files}
+    # GitHub-hosted p2 sites can map bundles and features to root-level JARs.
+    # Read their declared identities instead of treating these as metadata JARs.
+    flat_coordinates = {}
+    if (args.site / "artifacts.jar").is_file():
+        with zipfile.ZipFile(args.site / "artifacts.jar") as archive:
+            metadata = ET.fromstring(archive.read("artifacts.xml"))
+        flat_classifiers = set()
+        for rule in metadata.findall("./mappings/rule"):
+            if rule.get("output") == "${repoUrl}/${id}_${version}.jar":
+                for classifier in ("osgi.bundle", "org.eclipse.update.feature"):
+                    if f"classifier={classifier}" in rule.get("filter", ""):
+                        flat_classifiers.add(classifier)
+        for artifact in metadata.findall("./artifacts/artifact"):
+            if artifact.get("classifier") in flat_classifiers:
+                name, version = artifact.attrib["id"], artifact.attrib["version"]
+                flat_coordinates[f"{name}_{version}.jar"] = (name, version)
+
+    def site_coordinates(path):
+        return flat_coordinates.get(path.as_posix()) or coordinates(path)
+
+    expected = {site_coordinates(p.relative_to(args.site)) for p in files}
     expected.discard(None)
     # Publish payloads before metadata that advertises them.
-    files.sort(key=lambda p: coordinates(p.relative_to(args.site)) is None)
+    files.sort(key=lambda p: site_coordinates(p.relative_to(args.site)) is None)
     print(f"{len(files)} files, {len(expected)} distinct package coordinates", flush=True)
     if args.dry_run:
         return
@@ -76,7 +98,7 @@ def main():
             "chunk_size": 8 * 1024 * 1024,
             "content_type": "application/java-archive" if file.suffix == ".jar" else "application/octet-stream",
         }
-        coord = coordinates(path)
+        coord = site_coordinates(path)
         if coord:
             spec.update(artifact_name=coord[0], artifact_version=coord[1])
         session = api("POST", "/api/v1/uploads", spec)

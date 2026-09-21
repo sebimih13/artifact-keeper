@@ -1,5 +1,7 @@
 {
 	auto_https disable_redirects
+	# Java clients may omit SNI for the single-label localhost hostname.
+	default_sni localhost
 }
 
 (backend_routes) {
