@@ -19,7 +19,10 @@ from urllib.request import Request, urlopen
 
 
 def coordinates(path):
-    if path.parts[0] in ("plugins", "features") and path.suffix == ".jar":
+    # A regular site stores JARs under plugins/ and features/. Composite sites
+    # add a child directory first (for example 7.8.0/plugins/...). Matching
+    # the immediate parent supports both layouts without indexing metadata JARs.
+    if path.parent.name in ("plugins", "features") and path.suffix == ".jar":
         name, version = path.stem.rsplit("_", 1)
         if not name or not version:
             raise ValueError(f"Invalid p2 JAR filename: {path}")
