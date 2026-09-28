@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 
 """
-Build or mirror Docker images into Artifact Keeper using Python 3.9+ and Docker.
-See README.md for repository naming, authentication, TLS and pull examples.
+Publish existing local Docker images to Artifact Keeper; never build or pull.
+Requires Python 3.9+, Docker 28+, and Compose v2+ for Compose input.
 
-Set ARTIFACT_KEEPER_TOKEN and AK_API=https://localhost/docker (repository docker).
-Select --dockerfile, --docker-compose-file or --image. Dockerfile mode requires
---destination internal/name:tag, relative to the target repository namespace.
-Docker Compose resolves interpolation, includes, overrides and all profiles;
-services with build definitions are built, other service images are pulled.
+Set ARTIFACT_KEEPER_TOKEN and AK_API=https://localhost/docker.
+Use --image existing-name:tag or --docker-compose-file compose.yml.
+All images and the selected platform must already exist in the same daemon.
+Compose build-only services use the existing <project>-<service>:latest image;
+Compose build definitions are never executed. Use --project-name if the images
+were originally built with docker compose -p NAME.
 
-This is a single-platform seeder, not a complete registry replication tool.
-The platform defaults to the Docker daemon's OS/architecture. Docker 28+ is
-required for explicit platform inspection/push, and Compose v2+ for Compose mode.
-Docker manages TLS trust; Python CA environment variables do not configure it.
-Source credentials use your normal Docker configuration. Target credentials are
-kept in a temporary configuration and removed after the run. Images/build cache
-remain in Docker; the script does not prune them or start Compose services.
+Docker Hub names map to library/name or namespace/name inside the repository,
+so AK_DEFAULT_DOCKER_MIRROR_REPO=docker can serve unchanged Docker Hub names.
+Other registry names retain their registry prefix and require explicit pulls
+from Artifact Keeper; Docker's registry-mirrors setting only mirrors Docker Hub.
+
+Target credentials are temporary. Existing daemon/context selection is preserved.
+Single-platform publication does not preserve multi-platform index digests,
+signatures or attestations. See README.md for mirror authentication and TLS.
 """
 
 import argparse
@@ -29,7 +31,6 @@ import subprocess
 import sys
 import tempfile
 import urllib.parse
-import uuid
 
 from pathlib import Path
 
@@ -70,7 +71,10 @@ def parse_image(reference: str):
     path = "/".join(parts)
     source = f"{registry}/{path}" + (f"@{digest}" if separator else f":{tag}")
     target_tag = digest.replace(":", "-", 1) if separator else tag
-    return source, f"{registry.replace(':', '-port-')}/{path}:{target_tag}"
+    destination = f"{path}:{target_tag}"
+    if registry != "docker.io":
+        destination = f"{registry.replace(':', '-port-')}/{destination}"
+    return source, destination
 
 
 def validate_destination(value: str):
@@ -84,18 +88,15 @@ def validate_destination(value: str):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Download or build Docker images and publish them to Artifact Keeper."
+        description="Publish images already present in the Docker daemon to Artifact Keeper."
     )
     inputs = parser.add_mutually_exclusive_group(required=True)
-    inputs.add_argument("--dockerfile", type=Path, help="Dockerfile for an internal image")
     inputs.add_argument("--docker-compose-file", type=Path, action="append", help="Compose file; repeat to merge override files")
-    inputs.add_argument("--image", help="Image name, name:tag, or name@sha256:digest")
+    inputs.add_argument("--image", help="Existing local image name, name:tag, or name@sha256:digest")
 
     parser.add_argument("--artifact-keeper", default=os.environ.get("AK_API"), help="Target https://host/repository-key (default: AK_API)")
-    parser.add_argument("--destination", help="Target name:tag inside the repository; required with --dockerfile")
-    parser.add_argument("--context", type=Path, help="Docker build context (default: Dockerfile parent)")
-    parser.add_argument("--build-arg", action="append", default=[], help="Dockerfile build argument; repeat as needed")
-    parser.add_argument("--target", help="Dockerfile build stage")
+    parser.add_argument("--destination", help="Target name:tag inside the repository (single-image mode only)")
+    parser.add_argument("--project-name", help="Compose project name used when the images were built")
     parser.add_argument("--platform", help="One OS/architecture[/variant]; default: Docker daemon platform")
     parser.add_argument("--env-file", type=Path, action="append", default=[], help="Compose interpolation env file; repeat as needed")
     parser.add_argument("--work-dir", type=Path, default=Path(DEFAULT_WORK_DIR))
@@ -113,12 +114,10 @@ def parse_args():
         parser.error("Use https://host/repository-key, for example https://localhost/docker; /npm/npm is not a Docker endpoint")
     args.registry = url.netloc
     args.repository = url.path.strip("/")
-    if args.dockerfile and not args.destination:
-        parser.error("--dockerfile requires --destination internal/name:tag")
     if args.docker_compose_file and args.destination:
-        parser.error("--destination is only available for --image or --dockerfile")
-    if (args.context or args.build_arg or args.target) and not args.dockerfile:
-        parser.error("--context, --build-arg and --target require --dockerfile")
+        parser.error("--destination is only available for --image")
+    if args.project_name and not args.docker_compose_file:
+        parser.error("--project-name requires --docker-compose-file")
     if args.env_file and not args.docker_compose_file:
         parser.error("--env-file requires --docker-compose-file")
     if args.platform and not re.fullmatch(r"[a-z0-9]+/[a-z0-9]+(?:/[a-z0-9]+)?", args.platform):
@@ -132,21 +131,15 @@ def parse_args():
         parser.error("--image must not be empty")
     if args.destination:
         validate_destination(args.destination)
-    for key in ("dockerfile", "context", "work_dir"):
+    for key in ("work_dir",):
         value = getattr(args, key)
         if value is not None:
             setattr(args, key, value.expanduser().resolve())
     args.docker_compose_file = [path.expanduser().resolve() for path in args.docker_compose_file or []]
     args.env_file = [path.expanduser().resolve() for path in args.env_file]
-    for path in ([args.dockerfile] if args.dockerfile else []) + args.docker_compose_file + args.env_file:
+    for path in args.docker_compose_file + args.env_file:
         if not path.is_file():
             parser.error(f"File does not exist: {path}")
-    if args.dockerfile:
-        args.context = args.context or args.dockerfile.parent
-        if not args.context.is_dir():
-            parser.error(f"Build context does not exist: {args.context}")
-        if args.work_dir.is_relative_to(args.context):
-            parser.error("--work-dir must be outside the build context")
     return args
 
 
@@ -187,6 +180,8 @@ def target_configuration(directory: Path, registry: str, token: str):
 
 def compose_plan(args, docker, env, default_platform):
     command = [docker, "compose"]
+    if args.project_name:
+        command.extend(["--project-name", args.project_name])
     for path in args.docker_compose_file:
         command.extend(["--file", str(path)])
     for path in args.env_file:
@@ -201,24 +196,12 @@ def compose_plan(args, docker, env, default_platform):
         if args.platform and configuration.get("platform") and args.platform != configuration["platform"]:
             raise ValueError(f"Service {service} platform conflicts with --platform")
         source = configuration.get("image")
-        if "build" in configuration:
-            context = configuration["build"].get("context", "")
-            if context and Path(context).is_absolute() and args.work_dir.is_relative_to(Path(context).resolve()):
-                raise ValueError(f"--work-dir must be outside the build context for service {service}")
-            build_platforms = configuration["build"].get("platforms", [])
-            if build_platforms and build_platforms != [platform]:
-                raise ValueError(f"Service {service} build.platforms must match its single selected platform {platform}")
-            source = source or f"{model['name']}-{service}:latest"
-            _, destination = parse_image(source)
-            if not configuration.get("image"):
-                destination = validate_destination(f"internal/{model['name']}/{service}:latest")
-            tasks.append({"source": source, "destination": destination, "platform": platform,
-                          "build": [*command, "build", "--pull", service], "service": service})
-        elif source:
-            source, destination = parse_image(source)
-            tasks.append({"source": source, "destination": destination, "platform": platform})
-        else:
+        if not source and "build" in configuration:
+            source = f"{model['name']}-{service}:latest"
+        if not source:
             raise ValueError(f"Compose service {service} has neither image nor build")
+        source, destination = parse_image(source)
+        tasks.append({"source": source, "destination": destination, "platform": platform})
     if not tasks:
         raise ValueError("No service images were found in the Compose model")
     return tasks
@@ -234,35 +217,23 @@ def seed(args, docker: str, token: str, directory: Path):
     if not re.fullmatch(r"[a-z0-9]+/[a-z0-9]+(?:/[a-z0-9]+)?", default_platform):
         raise RuntimeError(f"Could not determine the Docker daemon platform: {platform}")
 
-    if args.dockerfile:
-        print("==> Mode: Dockerfile")
-        build_reference = f"ak-seeder-build:{uuid.uuid4().hex}"
-        command = [docker, "build", "--pull", "--load", "--file", str(args.dockerfile),
-                   "--platform", default_platform, "--tag", build_reference]
-        if args.target:
-            command.extend(["--target", args.target])
-        for argument in args.build_arg:
-            command.extend(["--build-arg", argument])
-        command.append(str(args.context))
-        tasks = [{"destination": args.destination, "platform": default_platform,
-                  "build": command, "build_reference": build_reference, "source": str(args.dockerfile)}]
-    elif args.docker_compose_file:
-        print("==> Mode: Docker Compose")
+    if args.docker_compose_file:
+        print("==> Mode: Docker Compose (local images)")
         tasks = compose_plan(args, docker, env, default_platform)
     else:
         print("==> Mode: single image")
         source, destination = parse_image(args.image)
         tasks = [{"source": source, "destination": args.destination or destination, "platform": default_platform}]
 
-    # Resolve destination collisions before pulling, building or publishing.
+    # Resolve destination collisions before publishing.
     unique = {}
     skipped = 0
     for task in tasks:
         key = task["destination"]
         if key in unique:
             previous = unique[key]
-            if any(previous.get(field) != task.get(field) for field in ("source", "platform", "build")):
-                raise ValueError(f"Different images/platforms map to {key}; give them distinct image tags")
+            if any(previous.get(field) != task.get(field) for field in ("source", "platform")):
+                raise ValueError(f"Different local images/platforms map to {key}; give them distinct image tags")
             print(f"SKIP: duplicate Compose image {task['source']}")
             skipped += 1
             continue
@@ -281,26 +252,25 @@ def seed(args, docker: str, token: str, directory: Path):
         try:
             task_env = env.copy()
             task_env["DOCKER_DEFAULT_PLATFORM"] = task["platform"]
-            if task.get("build"):
-                print("==> Building image")
-                run_command(task["build"], env=task_env, timeout=args.command_timeout)
-            else:
-                print("==> Downloading image")
-                run_command([docker, "pull", "--platform", task["platform"], task["source"]], env=task_env, timeout=args.command_timeout)
-
-            reference = task.get("build_reference") or task["source"]
-            image_id = run_command(
-                [docker, "image", "inspect", "--platform", task["platform"], "--format", "{{.Id}}", reference],
-                env=task_env, timeout=args.command_timeout,
-            ).strip()
+            print("==> Inspecting existing local image")
+            reference = task["source"]
+            try:
+                image_id = run_command(
+                    [docker, "image", "inspect", "--platform", task["platform"], "--format", "{{.Id}}", reference],
+                    env=task_env, timeout=args.command_timeout,
+                ).strip()
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"Cannot inspect local image {reference} for {task['platform']}. "
+                    f"Build or load it in this Docker daemon before seeding.\n{exc}"
+                ) from exc
             if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
                 raise RuntimeError("Docker returned an invalid image ID")
             # A containerd image store may not resolve the config digest as an
             # image reference. Tag the named image and select its platform on push.
             run_command([docker, "tag", reference, destination], env=task_env, timeout=args.command_timeout)
             print("Uploading to Artifact Keeper...")
-            # Create credentials only after building; no build context should
-            # accidentally capture the temporary authentication configuration.
+            # Keep target credentials isolated from the user's Docker config.
             with tempfile.TemporaryDirectory(prefix="auth-", dir=directory) as auth_directory:
                 auth = Path(auth_directory)
                 target_configuration(auth, args.registry, token)
