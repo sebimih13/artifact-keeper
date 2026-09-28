@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 
 """
-Publish existing local Docker images to Artifact Keeper; never build or pull.
+Publish Docker images to Artifact Keeper; reuse local images and pull missing ones.
 Requires Python 3.9+, Docker 28+, and Compose v2+ for Compose input.
 
 Set ARTIFACT_KEEPER_TOKEN and AK_API=https://localhost/docker.
 Use --image existing-name:tag or --docker-compose-file compose.yml.
-All images and the selected platform must already exist in the same daemon.
+Missing named images/platforms are pulled using the selected daemon and its mirrors.
 Compose build-only services use the existing <project>-<service>:latest image;
 Compose build definitions are never executed. Use --project-name if the images
 were originally built with docker compose -p NAME.
@@ -88,11 +88,11 @@ def validate_destination(value: str):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Publish images already present in the Docker daemon to Artifact Keeper."
+        description="Reuse local images or pull missing images, then publish to Artifact Keeper."
     )
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--docker-compose-file", type=Path, action="append", help="Compose file; repeat to merge override files")
-    inputs.add_argument("--image", help="Existing local image name, name:tag, or name@sha256:digest")
+    inputs.add_argument("--image", help="Image name, name:tag, or name@sha256:digest; pulled only when missing locally")
 
     parser.add_argument("--artifact-keeper", default=os.environ.get("AK_API"), help="Target https://host/repository-key (default: AK_API)")
     parser.add_argument("--destination", help="Target name:tag inside the repository (single-image mode only)")
@@ -201,10 +201,41 @@ def compose_plan(args, docker, env, default_platform):
         if not source:
             raise ValueError(f"Compose service {service} has neither image nor build")
         source, destination = parse_image(source)
-        tasks.append({"source": source, "destination": destination, "platform": platform})
+        tasks.append({"source": source, "destination": destination, "platform": platform,
+                      "pull_if_missing": bool(configuration.get("image"))})
     if not tasks:
         raise ValueError("No service images were found in the Compose model")
     return tasks
+
+
+def ensure_local_image(docker, task, env, timeout):
+    reference = task["source"]
+    inspect = [docker, "image", "inspect", "--platform", task["platform"], "--format", "{{.Id}}", reference]
+    try:
+        return run_command(inspect, env=env, timeout=timeout).strip()
+    except RuntimeError as exc:
+        cause = exc.__cause__
+        details = ((cause.stderr or "") + (cause.stdout or "")).lower() if isinstance(cause, subprocess.CalledProcessError) else ""
+        missing = any(message in details for message in (
+            "no such image",
+            "does not match the specified platform",
+            "does not provide the specified platform",
+        ))
+        if not missing:
+            raise
+        if not task.get("pull_if_missing", True):
+            raise RuntimeError(
+                f"Build-only Compose image {reference} is missing locally. "
+                "Build/load it separately, or set an explicit image: name that can be pulled."
+            ) from exc
+
+    print(f"MISSING: {reference} ({task['platform']})")
+    print("==> Downloading missing image")
+    run_command(
+        [docker, "pull", "--platform", task["platform"], reference],
+        env=env, timeout=timeout,
+    )
+    return run_command(inspect, env=env, timeout=timeout).strip()
 
 
 def seed(args, docker: str, token: str, directory: Path):
@@ -218,7 +249,7 @@ def seed(args, docker: str, token: str, directory: Path):
         raise RuntimeError(f"Could not determine the Docker daemon platform: {platform}")
 
     if args.docker_compose_file:
-        print("==> Mode: Docker Compose (local images)")
+        print("==> Mode: Docker Compose")
         tasks = compose_plan(args, docker, env, default_platform)
     else:
         print("==> Mode: single image")
@@ -234,6 +265,7 @@ def seed(args, docker: str, token: str, directory: Path):
             previous = unique[key]
             if any(previous.get(field) != task.get(field) for field in ("source", "platform")):
                 raise ValueError(f"Different local images/platforms map to {key}; give them distinct image tags")
+            previous["pull_if_missing"] = previous.get("pull_if_missing", True) or task.get("pull_if_missing", True)
             print(f"SKIP: duplicate Compose image {task['source']}")
             skipped += 1
             continue
@@ -254,16 +286,7 @@ def seed(args, docker: str, token: str, directory: Path):
             task_env["DOCKER_DEFAULT_PLATFORM"] = task["platform"]
             print("==> Inspecting existing local image")
             reference = task["source"]
-            try:
-                image_id = run_command(
-                    [docker, "image", "inspect", "--platform", task["platform"], "--format", "{{.Id}}", reference],
-                    env=task_env, timeout=args.command_timeout,
-                ).strip()
-            except RuntimeError as exc:
-                raise RuntimeError(
-                    f"Cannot inspect local image {reference} for {task['platform']}. "
-                    f"Build or load it in this Docker daemon before seeding.\n{exc}"
-                ) from exc
+            image_id = ensure_local_image(docker, task, task_env, args.command_timeout)
             if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
                 raise RuntimeError("Docker returned an invalid image ID")
             # A containerd image store may not resolve the config digest as an

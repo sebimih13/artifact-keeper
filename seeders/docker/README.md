@@ -1,8 +1,11 @@
-# Docker image seeder: local images only
+# Docker image seeder: reuse local images, pull missing images
 
-`seed-docker.py` publishes images **already present in the selected Docker
-daemon's image store**. It never runs `docker build`, `docker compose build`,
-`docker pull` or `docker compose pull`. A missing image/platform fails clearly.
+`seed-docker.py` reuses images already present in the selected Docker daemon.
+If a named image or selected platform is missing, it runs `docker pull`, then
+publishes the image to Artifact Keeper. Existing local tags are not refreshed.
+It never runs `docker build` or `docker compose build`. Pull failures are
+reported as failed image jobs; daemon, permission and inspection errors are
+not treated as missing images.
 It does not start containers, prune images or change your saved Docker logins.
 
 Requires Python 3.9+, Docker Engine/CLI 28+, and Compose v2+ for Compose input.
@@ -36,8 +39,9 @@ must exist, and the token must have push permission.
 | `DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH` | Optional TLS settings for contacting a remote daemon, not registry trust. |
 | `DOCKER_CONFIG` | Existing client config/context location; target credentials remain temporary. |
 
-Names, tags and locally available digest references are supported. An omitted
-tag means `latest`; the script inspects that local tag without refreshing it.
+Names, tags and digest references are supported. An omitted tag means `latest`.
+Missing images are pulled using your existing Docker credentials and daemon
+mirror configuration. For private upstreams, log in to that registry first.
 Temporary target credentials use a mode-0600 configuration that is removed
 after each push. Images and destination tags remain in the daemon.
 
@@ -53,9 +57,10 @@ Repeat `--docker-compose-file` to merge overrides in order. All profiles are
 included, and Docker Compose resolves interpolation and includes. Duplicate
 image/platform entries are published once. A `build:` section is never run.
 
-Services with `image:` use that existing local image, even when `build:` is
-also present. Build-only services use the local `<project>-<service>:latest`
-image. Supply `--project-name NAME` if the previous build used `docker compose
+Services with `image:` reuse the local image or pull it if missing, even when
+`build:` is also present. Build-only services use the local
+`<project>-<service>:latest` image and fail if it is missing: there is no explicit
+registry image to pull. Build/load those separately or add a pullable `image:`. Supply `--project-name NAME` if the previous build used `docker compose
 -p NAME`. Explicit `image:` names are preferable for deployment: a build-only
 service has no explicit registry image name for `compose pull` to use.
 
@@ -185,7 +190,7 @@ mirror workflow.
 
 `Uploaded` counts successful pushes, including repeat pushes. Docker reuses
 existing layers. `Skipped` counts duplicate Compose entries; `Failed` counts
-image jobs that failed, including missing local images. Failures return a
+image jobs that failed, including failed pulls and missing build-only images. Failures return a
 nonzero exit status. The summary uses the same fields as the PyPI seeder.
 
 References: [Docker Hub mirrors](https://docs.docker.com/docker-hub/image-library/mirror/),
