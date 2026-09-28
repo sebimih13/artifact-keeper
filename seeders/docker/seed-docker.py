@@ -111,7 +111,7 @@ def parse_args():
         or url.query or url.fragment or not re.fullmatch(r"/[a-z0-9][a-z0-9_-]*/?", url.path)
         or any(character.isspace() for character in args.artifact_keeper)
     ):
-        parser.error("Use https://host/repository-key, for example https://localhost/docker; /npm/npm is not a Docker endpoint")
+        parser.error("Use https://host/repository-key, for example https://localhost/docker")
     args.registry = url.netloc
     args.repository = url.path.strip("/")
     if args.docker_compose_file and args.destination:
