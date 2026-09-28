@@ -12,6 +12,7 @@ Setup:
 Choose exactly one input:
     .venv/bin/python seed-pypi.py --project-dir /path/to/project
     .venv/bin/python seed-pypi.py --requirements-file /path/to/requirements.txt
+    .venv/bin/python seed-pypi.py --wheel /path/to/package.whl
     .venv/bin/python seed-pypi.py --dependency 'requests[socks]==2.32.3'
 
 Use --ca-bundle with a PEM bundle containing public roots and your local CA.
@@ -20,6 +21,10 @@ select CPython/manylinux wheel targets. Temporary workspaces are removed
 after each run; existing files under --work-dir are never deleted.
 
 Scope:
+    Wheel mode validates and uploads one existing wheel without building or
+    downloading dependencies. Only .whl files are accepted; .zip files are
+    rejected. The source is preserved.
+
     Project mode builds a wheel and sdist for the running interpreter/host,
     then seeds runtime dependencies. Optional project extras and build-time
     dependencies are not automatically seeded; list these separately in a
@@ -48,6 +53,7 @@ import base64
 import importlib.util
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import sys
@@ -62,6 +68,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from packaging.requirements import InvalidRequirement, Requirement
+from packaging.tags import parse_tag
+from packaging.version import Version
 from packaging.utils import canonicalize_name, parse_sdist_filename, parse_wheel_filename
 
 
@@ -96,6 +104,12 @@ def parse_args():
     )
 
     inputs = parser.add_mutually_exclusive_group(required=True)
+
+    inputs.add_argument(
+        "--wheel",
+        type=Path,
+        help="Existing wheel to upload without building or downloading dependencies (.whl only)",
+    )
 
     inputs.add_argument(
         "--project-dir",
@@ -214,7 +228,7 @@ def parse_args():
         except InvalidRequirement:
             parser.error("--dependency must be a valid package requirement, for example requests[socks]==2.32.3")
 
-    for name in ("project_dir", "requirements_file", "work_dir", "ca_bundle"):
+    for name in ("wheel", "project_dir", "requirements_file", "work_dir", "ca_bundle"):
         path = getattr(args, name)
         if path is not None:
             setattr(args, name, path.expanduser().resolve())
@@ -658,6 +672,53 @@ def upload_artifacts(
 
 
 
+def prepare_local_wheel(source: Path, dist_dir: Path):
+    if not source.is_file():
+        raise RuntimeError(f"Wheel does not exist: {source}")
+
+    filename = source.name
+    if not filename.endswith(".whl"):
+        raise ValueError("--wheel expects a .whl file; .zip files are not accepted")
+
+    name, version, _, tags = parse_wheel_filename(filename)
+    target = dist_dir / filename
+    shutil.copyfile(source, target)
+
+    with zipfile.ZipFile(target) as archive:
+        wheels = [entry for entry in archive.namelist() if entry.endswith(".dist-info/WHEEL")]
+        if len(wheels) != 1:
+            raise RuntimeError("Expected one .dist-info/WHEEL; ZIP wrappers containing another wheel are not supported")
+        prefix = wheels[0].rsplit("/", 1)[0]
+        if prefix + "/METADATA" not in archive.namelist() or prefix + "/RECORD" not in archive.namelist():
+            raise RuntimeError("Wheel is missing METADATA or RECORD")
+        bad_member = archive.testzip()
+        if bad_member:
+            raise RuntimeError(f"Corrupt wheel member: {bad_member}")
+        message = BytesParser(policy=policy.default).parsebytes(archive.read(wheels[0]))
+
+    package_name, _, package_version, _ = extract_metadata(target)
+    if canonicalize_name(package_name) != name or Version(package_version) != version:
+        raise RuntimeError("Wheel filename does not match its package metadata")
+    metadata_tags = set()
+    for tag in message.get_all("Tag", []):
+        metadata_tags.update(parse_tag(tag))
+    if metadata_tags != tags:
+        raise RuntimeError("Wheel filename tags do not match its WHEEL metadata")
+
+    return target
+
+
+def print_summary(total, uploaded, skipped, failed):
+    print()
+    print("=" * 60)
+    print("Summary")
+    print("=" * 60)
+    print(f"Total:    {total}")
+    print(f"Uploaded: {uploaded}")
+    print(f"Skipped:  {skipped}")
+    print(f"Failed:   {failed}")
+
+
 def main():
     args = parse_args()
 
@@ -670,7 +731,9 @@ def main():
         print(f"ERROR: CA bundle does not exist: {args.ca_bundle}", file=sys.stderr)
         return 1
 
-    modules = ["pip", "twine"]
+    modules = ["twine"]
+    if not args.wheel:
+        modules.append("pip")
     if args.project_dir:
         modules.append("build")
 
@@ -685,7 +748,7 @@ def main():
         with tempfile.TemporaryDirectory(prefix="run-", dir=args.work_dir) as directory:
             return seed(args, token, Path(directory))
 
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError, zipfile.BadZipFile) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
@@ -706,6 +769,32 @@ def seed(args, token: str, work_dir: Path):
     env = pypi_environment(args.ca_bundle)
 
     ssl_context = create_ssl_context(args.ca_bundle)
+
+    if args.wheel:
+        print("==> Mode: local wheel")
+        print(f"    Wheel: {args.wheel}")
+        print()
+
+        wheel = prepare_local_wheel(args.wheel, dist_dir)
+        print("==> Checking wheel distribution")
+        run_command(
+            [python, "-m", "twine", "check", str(wheel)],
+            env=env,
+            timeout=args.command_timeout,
+        )
+        uploaded, skipped, failed = upload_artifacts(
+            python,
+            [wheel],
+            args.artifact_keeper,
+            token,
+            ssl_context,
+            env,
+            args.http_timeout,
+            args.command_timeout,
+            "Wheel",
+        )
+        print_summary(uploaded + skipped + failed, uploaded, skipped, failed)
+        return 1 if failed else 0
 
     project_files = []
 
@@ -872,14 +961,7 @@ def seed(args, token: str, work_dir: Path):
     skipped = dep_skipped + pkg_skipped
     failed = dep_failed + pkg_failed
 
-    print()
-    print("=" * 60)
-    print("Summary")
-    print("=" * 60)
-    print(f"Total:    {total}")
-    print(f"Uploaded: {uploaded}")
-    print(f"Skipped:  {skipped}")
-    print(f"Failed:   {failed}")
+    print_summary(total, uploaded, skipped, failed)
 
     return 1 if failed else 0
 

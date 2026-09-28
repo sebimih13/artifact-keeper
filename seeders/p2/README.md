@@ -44,7 +44,7 @@ This uses Artifact Keeper's raw artifact API to serve a static P2 site. Select *
 Run from the project root, using your existing mirror:
 
 ```bash
-export ECLIPSE=/home/seb/eclipse/java-2026-06/eclipse/eclipse
+export ECLIPSE=/home/seb/eclipse/committers-2026-06/eclipse/eclipse
 
 python3 seeders/p2/seed-p2.py \
   --source-dir seeders/p2/mirror \
@@ -61,7 +61,7 @@ Create the repository described above, then set:
 ```bash
 export ARTIFACT_KEEPER_TOKEN='<token with repository read/write access>'
 export AK_API=https://localhost/api/v1/repositories/p2-generic
-export ECLIPSE=/home/seb/eclipse/java-2026-06/eclipse/eclipse
+export ECLIPSE=/home/seb/eclipse/committers-2026-06/eclipse/eclipse
 
 python3 seeders/p2/seed-p2.py \
   --source-dir seeders/p2/mirror \
@@ -121,3 +121,23 @@ python3 -m unittest discover -s seeders/p2 -p 'test_*.py'
 ```
 
 These tests use a temporary HTTP server to check upload order, repeat-run skips, new-plugin publication, conflicting JAR rejection and failure handling. They also verify XML preservation and timestamp reuse. They do not require Eclipse or a running Artifact Keeper server; a real publisher run is exercised separately using `--generate-only`.
+
+## Troubleshooting Eclipse HTTPS access
+
+`PKIX path building failed` means the Java runtime used by Eclipse cannot validate the server certificate. Python's `--ca-bundle` does not configure Java. Use the current Caddy root CA from the running container and a dedicated Java trust store containing the normal public roots plus that CA. A recreated Caddy data volume can change the CA; a replacement Eclipse installation can also lose custom JVM settings.
+
+On this workstation, the dedicated trust store is `/home/seb/Developer/artifact-keeper/.local/eclipse-cacerts`. The current Committers installation is configured with this line **after `-vmargs`** in its `eclipse.ini`:
+
+```ini
+-Djavax.net.ssl.trustStore=/home/seb/Developer/artifact-keeper/.local/eclipse-cacerts
+```
+
+Restart Eclipse after changing the trust store or JVM settings. Other installations need their own configuration. Certificate verification remains enabled.
+
+Under **Preferences → Install/Update → Available Software Sites**, remove incorrect entries ending in `content.xml.xz` or the repository API root. Keep the complete update-site directory URL:
+
+```text
+https://localhost/api/v1/repositories/p2-generic/download/
+```
+
+Do not enter an individual metadata filename as the site location. Eclipse appends the filenames itself. An error mentioning `content.xml.xz/content.xml` can result from entering the XZ file as the repository location.
