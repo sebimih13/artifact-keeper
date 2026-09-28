@@ -1,17 +1,70 @@
 #!/usr/bin/env python3
 
+"""
+Mirror registry dependencies into Artifact Keeper using Python 3.11+ and npm.
+No third-party Python modules or Makefile are required.
+
+Configuration:
+    export ARTIFACT_KEEPER_TOKEN=...
+    export AK_API=https://localhost/npm/npm
+
+Choose exactly one input:
+    python3 seed-npm.py --package-lock /path/to/package-lock.json
+    python3 seed-npm.py --package-json /path/to/package.json
+    python3 seed-npm.py --dependency '@scope/package@1.2.3'
+
+Prefer --package-lock for reproducible seeding of exact transitive versions.
+Lockfile versions 1, 2 and 3 and npm-shrinkwrap.json are supported.
+--package-json resolves afresh, without using adjacent lockfiles or .npmrc.
+It mirrors dependencies, not the root project itself. Generate workspace
+lockfiles inside their original project before using --package-lock.
+--dependency accepts registry names, versions, ranges, tags and npm aliases.
+
+Use --ca-bundle with a PEM bundle containing public roots and your local CA.
+NPM selects the npm executable. All other options are CLI arguments.
+Each run uses a temporary workspace/cache and removes its authentication file.
+Lifecycle scripts are disabled while resolving, packing and publishing.
+Tarballs are checked against lockfile hashes, when present, and package identity.
+Existing target name/version pairs are skipped, without comparing their bytes.
+
+Scope:
+    All registry entries recorded in the lockfile are mirrored, including dev,
+    peer, optional and platform-specific entries. Bundled dependencies travel
+    inside their parent's tarball; workspace links remain local links.
+    Missing platform entries cannot be recovered from an incomplete lockfile.
+    Git, local file/tarball and arbitrary URL dependencies are not converted
+    into registry releases. Private upstream authentication, Yarn/pnpm locks,
+    install-script binary downloads and native build tools need separate setup.
+
+Publishing uses --publish-tag seeded by default, so historical releases do not
+overwrite an existing latest tag. Upstream dist-tags, deprecation notices and
+provenance are not mirrored. Use exact versions/ranges for reproducible installs.
+
+Install using npm install or npm ci with --registry https://localhost/npm/npm/,
+plus client authentication and CA trust. Locks with custom resolved hosts and
+direct URL dependencies may still access those hosts; --registry alone does
+not rewrite every source. Commit both package.json and package-lock.json.
+Publish your own prepared package separately with npm publish <folder-or-tgz>.
+"""
+
 import argparse
+import base64
+import hashlib
+import hmac
 import json
 import os
+import re
 import shutil
 import ssl
 import subprocess
 import sys
+import tarfile
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 DEFAULT_PUBLIC_REGISTRY = "https://registry.npmjs.org/"
@@ -55,8 +108,8 @@ def parse_args():
 
     parser.add_argument(
         "--artifact-keeper",
-        required=True,
-        help="Artifact Keeper npm registry URL",
+        default=os.environ.get("AK_API"),
+        help="Artifact Keeper npm registry URL (default: AK_API)",
     )
 
     parser.add_argument(
@@ -69,6 +122,7 @@ def parse_args():
         "--work-dir",
         type=Path,
         default=Path(DEFAULT_WORK_DIR),
+        help="Parent of temporary workspaces; existing files are preserved",
     )
 
     parser.add_argument(
@@ -89,7 +143,56 @@ def parse_args():
         default=NPM_TIMEOUT,
     )
 
-    return parser.parse_args()
+    parser.add_argument(
+        "--publish-tag",
+        default="seeded",
+        help="Tag for mirrored versions (default: seeded; upstream tags are not copied)",
+    )
+
+    args = parser.parse_args()
+
+    if not args.artifact_keeper:
+        parser.error("--artifact-keeper or AK_API is required")
+
+    for url in (args.artifact_keeper, args.public_registry):
+        validate_registry_url(url)
+
+    if args.http_timeout <= 0 or args.npm_timeout <= 0:
+        parser.error("Timeouts must be positive")
+
+    if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_-]*", args.publish_tag):
+        parser.error("Publish tag must start with a letter and contain letters, digits, _ or -")
+
+    if args.dependency is not None:
+        validate_dependency_spec(args.dependency)
+
+    for name in ("package_lock", "package_json", "work_dir", "ca_bundle"):
+        path = getattr(args, name)
+        if path is not None:
+            setattr(args, name, path.expanduser().resolve())
+
+    return args
+
+
+def validate_dependency_spec(spec: str):
+    name = r"(?:@[a-zA-Z0-9_.-]+/)?[a-zA-Z0-9_][a-zA-Z0-9_.-]*"
+    selector = r"[a-zA-Z0-9.*~^<>=|+ -]+"
+    if not re.fullmatch(rf"{name}(?:@(?:{selector}|npm:{name}(?:@{selector})?))?", spec):
+        raise ValueError("Use a registry package name with a version, range, tag or npm alias; Git/file/URL sources are not supported")
+
+
+def validate_registry_url(url: str):
+    parsed = urllib.parse.urlsplit(url)
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or any(character.isspace() for character in url)
+    ):
+        raise ValueError("Registry URLs must be HTTP(S) URLs without credentials, query or fragment")
 
 
 def normalize_registry(url: str) -> str:
@@ -97,8 +200,15 @@ def normalize_registry(url: str) -> str:
 
 
 def npm_environment(ca_bundle: Path):
-    env = os.environ.copy()
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.lower().startswith("npm_config_")
+        and name not in ("ARTIFACT_KEEPER_TOKEN", "NPM_TOKEN", "NODE_AUTH_TOKEN", "NODE_ENV")
+    }
 
+    env["NPM_CONFIG_UPDATE_NOTIFIER"] = "false"
+    env["NPM_CONFIG_STRICT_SSL"] = "true"
     env["NODE_EXTRA_CA_CERTS"] = str(ca_bundle)
     env["SSL_CERT_FILE"] = str(ca_bundle)
     env["NPM_CONFIG_CAFILE"] = str(ca_bundle)
@@ -115,6 +225,10 @@ def run_command(
     timeout=NPM_TIMEOUT,
     capture_output=True,
 ):
+    if not capture_output:
+        sys.stdout.flush()
+        sys.stderr.flush()
+
     try:
         return subprocess.run(
             command,
@@ -160,6 +274,21 @@ def generate_lock_from_package_json(
 
     resolution_dir.mkdir(parents=True, exist_ok=True)
     destination = resolution_dir / "package.json"
+    manifest = json.loads(package_json.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise RuntimeError("package.json must contain a JSON object")
+    if manifest.get("workspaces"):
+        raise RuntimeError("For workspaces, generate a lockfile in the project and use --package-lock")
+
+    for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+        dependencies = manifest.get(section, {})
+        if not isinstance(dependencies, dict):
+            raise RuntimeError(f"{section} must contain an object")
+        for name, spec in dependencies.items():
+            if not isinstance(spec, str):
+                raise RuntimeError(f"Invalid dependency specifier for {name}")
+            validate_dependency_spec(f"{name}@{spec}")
+
     shutil.copy2(package_json, destination)
 
     command = [
@@ -169,6 +298,9 @@ def generate_lock_from_package_json(
         "--ignore-scripts",
         "--no-audit",
         "--no-fund",
+        "--include=dev",
+        "--include=optional",
+        "--include=peer",
         "--registry",
         public_registry,
         "--cache",
@@ -226,6 +358,9 @@ def generate_lock_from_dependency(
         "--save-exact",
         "--no-audit",
         "--no-fund",
+        "--include=dev",
+        "--include=optional",
+        "--include=peer",
         "--registry",
         public_registry,
         "--cache",
@@ -233,6 +368,7 @@ def generate_lock_from_dependency(
         "--prefer-online",
         "--userconfig",
         os.devnull,
+        "--",
         dependency,
     ]
 
@@ -300,86 +436,146 @@ def resolve_package_lock(
     )
 
 
-def load_dependencies_v2_v3(lock: dict):
-    dependencies = set()
+def add_dependency(dependencies, name, metadata, public_registry):
+    if not isinstance(metadata, dict):
+        raise RuntimeError(f"Invalid lockfile entry for {name}")
 
+    if metadata.get("inBundle") or metadata.get("bundled"):
+        # These bytes are already included in the parent's tarball.
+        return
+
+    version = metadata.get("version")
+    name = metadata.get("name") or name
+
+    if isinstance(version, str) and version.startswith("npm:"):
+        name, _, version = version[4:].rpartition("@")
+
+    if not isinstance(name, str) or not re.fullmatch(r"(?:@[a-zA-Z0-9_.-]+/)?[a-zA-Z0-9_][a-zA-Z0-9_.-]*", name):
+        raise RuntimeError(f"Invalid package name in lockfile: {name}")
+
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", version):
+        raise RuntimeError(f"Unsupported or missing registry version for {name}: {version}")
+
+    resolved = metadata.get("resolved")
+    if resolved:
+        # Refuse to silently substitute a registry release for a Git/file/URL package.
+        validate_registry_url(resolved)
+        registries = (normalize_registry(public_registry), DEFAULT_PUBLIC_REGISTRY)
+        if not any(resolved.startswith(registry) for registry in registries):
+            raise RuntimeError(f"Unsupported source for {name}@{version}; set --public-registry to its source registry")
+
+    key = (name, version)
+    dependency = dependencies.setdefault(key, {
+        "name": name,
+        "version": version,
+        "resolved": resolved,
+        "integrities": set(),
+    })
+    integrity = metadata.get("integrity")
+    if integrity:
+        if not isinstance(integrity, str):
+            raise RuntimeError(f"Invalid integrity for {name}@{version}")
+        dependency["integrities"].add(integrity)
+
+
+def load_dependencies_v2_v3(lock: dict, public_registry: str):
+    dependencies = {}
     packages = lock.get("packages")
     if not isinstance(packages, dict):
-        return dependencies
+        raise RuntimeError("Lockfile version 2/3 must contain a packages object")
 
     marker = "node_modules/"
 
     for package_path, metadata in packages.items():
-        # Root package
         if not package_path:
             continue
-
         if not isinstance(metadata, dict):
+            raise RuntimeError(f"Invalid lockfile entry: {package_path}")
+        if metadata.get("link"):
+            if metadata.get("resolved") not in packages:
+                raise RuntimeError(f"Local link target is missing from lockfile: {package_path}")
+            print(f"LOCAL: {package_path} remains a workspace/link; only registry dependencies are mirrored")
             continue
-
-        # Workspace/symlink
-        if metadata.get("link", False):
-            continue
-
-        version = metadata.get("version")
-        if not version:
-            continue
-
         if marker not in package_path:
             continue
 
-        path_name = package_path.rsplit(marker, 1)[1]
-        name = metadata.get("name") or path_name
-        if not name:
-            continue
-
-        dependencies.add((name, str(version)))
+        name = package_path.rsplit(marker, 1)[1]
+        add_dependency(dependencies, name, metadata, public_registry)
 
     return dependencies
 
 
-def load_dependencies_v1(lock: dict):
-    dependencies = set()
+def load_dependencies_v1(lock: dict, public_registry: str):
+    dependencies = {}
 
     def visit(items):
         if not isinstance(items, dict):
-            return
+            raise RuntimeError("Lockfile dependencies must be an object")
 
         for name, metadata in items.items():
-            if not isinstance(metadata, dict):
-                continue
+            add_dependency(dependencies, name, metadata, public_registry)
+            visit(metadata.get("dependencies", {}))
 
-            version = metadata.get("version")
-            if version:
-                dependencies.add((name, str(version)))
-
-            visit(metadata.get("dependencies"))
-
-    visit(lock.get("dependencies"))
-
+    visit(lock.get("dependencies", {}))
     return dependencies
 
 
-def load_dependencies(package_lock: Path):
+def load_dependencies(package_lock: Path, public_registry: str):
     try:
-        with package_lock.open(encoding="utf-8") as f:
-            lock = json.load(f)
+        lock = json.loads(package_lock.read_text(encoding="utf-8"))
 
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Invalid JSON in {package_lock}: {exc}") from exc
 
-    dependencies = load_dependencies_v2_v3(lock)
+    if not isinstance(lock, dict):
+        raise RuntimeError("Lockfile must contain a JSON object")
 
-    if not dependencies:
-        dependencies = load_dependencies_v1(lock)
+    version = lock.get("lockfileVersion")
+    if version in (2, 3):
+        dependencies = load_dependencies_v2_v3(lock, public_registry)
+    elif version == 1:
+        dependencies = load_dependencies_v1(lock, public_registry)
+    else:
+        raise RuntimeError(f"Unsupported lockfileVersion: {version}; expected 1, 2 or 3")
 
     return sorted(
-        dependencies,
-        key=lambda item: (
-            item[0].lower(),
-            item[1],
-        ),
+        dependencies.values(),
+        key=lambda item: (item["name"].lower(), item["version"]),
     )
+
+
+def verify_tarball(tarball: Path, dependency):
+    for integrity in dependency["integrities"]:
+        digests = {}
+        for part in integrity.split():
+            algorithm, separator, digest = part.partition("-")
+            if separator and algorithm in ("sha512", "sha384", "sha256", "sha1"):
+                digests.setdefault(algorithm, []).append(digest.split("?", 1)[0])
+        if not digests:
+            raise RuntimeError(f"Unsupported lockfile integrity for {tarball.name}")
+        algorithm = next(name for name in ("sha512", "sha384", "sha256", "sha1") if name in digests)
+        with tarball.open("rb") as stream:
+            actual = base64.b64encode(hashlib.file_digest(stream, algorithm).digest()).decode()
+        if not any(hmac.compare_digest(actual, expected) for expected in digests[algorithm]):
+            raise RuntimeError(f"Lockfile integrity mismatch for {tarball.name}")
+
+    with tarfile.open(tarball, "r:gz") as archive:
+        manifests = [
+            member
+            for member in archive
+            if len(PurePosixPath(member.name).parts) == 2
+            and PurePosixPath(member.name).name == "package.json"
+        ]
+        if len(manifests) != 1:
+            raise RuntimeError(f"Expected one top-level package manifest in {tarball.name}")
+        member = manifests[0]
+        if not member.isfile() or member.size > 10 * 1024 * 1024:
+            raise RuntimeError(f"Invalid package manifest in {tarball.name}")
+        with archive.extractfile(member) as stream:
+            manifest = json.load(stream)
+
+    if manifest.get("name") != dependency["name"] or manifest.get("version") != dependency["version"]:
+        raise RuntimeError(f"Tarball identity does not match lockfile: {tarball.name}")
 
 
 def create_ssl_context(ca_bundle: Path):
@@ -462,8 +658,8 @@ def create_npmrc(
         f"_authToken={token}\n"
     )
 
-    npmrc.write_text(content, encoding="utf-8")
-    npmrc.chmod(0o600)
+    with os.fdopen(os.open(npmrc, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as stream:
+        stream.write(content)
 
 
 def npm_pack(
@@ -479,6 +675,7 @@ def npm_pack(
         npm,
         "pack",
         spec,
+        "--ignore-scripts",
         "--registry",
         public_registry,
         "--pack-destination",
@@ -493,6 +690,7 @@ def npm_pack(
 
     result = run_command(
         command,
+        cwd=pack_dir,
         env=env,
         timeout=timeout,
     )
@@ -507,6 +705,9 @@ def npm_pack(
             f"npm output:\n"
             f"{result.stdout}"
         ) from exc
+
+    if not isinstance(filename, str) or Path(filename).name != filename:
+        raise RuntimeError("npm pack returned an invalid filename")
 
     tarball = pack_dir / filename
     if not tarball.is_file():
@@ -527,6 +728,8 @@ def npm_publish(
     cache_dir: Path,
     env,
     timeout: int,
+    tag: str,
+    name: str,
 ):
     command = [
         npm,
@@ -539,18 +742,29 @@ def npm_publish(
         "--cache",
         str(cache_dir),
         "--provenance=false",
+        "--ignore-scripts",
+        "--tag",
+        tag,
     ]
+
+    if name.startswith("@"):
+        command.append(f"--{name.split('/')[0]}:registry={registry}")
 
     run_command(
         command,
         env=env,
         timeout=timeout,
+        cwd=tarball.parent,
         capture_output=False,
     )
 
 
 def main():
-    args = parse_args()
+    try:
+        args = parse_args()
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     token = os.environ.get("ARTIFACT_KEEPER_TOKEN")
     if not token:
@@ -584,25 +798,39 @@ def main():
         )
         return 1
 
+    try:
+        args.work_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="run-", dir=args.work_dir) as directory:
+            return seed(args, npm, token, Path(directory))
+
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+def seed(args, npm: str, token: str, work_dir: Path):
     args.artifact_keeper = normalize_registry(args.artifact_keeper)
     args.public_registry = normalize_registry(args.public_registry)
 
-    work_dir = args.work_dir
     pack_dir = work_dir / "packages"
     cache_dir = work_dir / "npm-cache"
     resolution_dir = work_dir / "resolution"
     npmrc = work_dir / "artifact-keeper.npmrc"
 
     work_dir.mkdir(parents=True, exist_ok=True)
+    # Stop npm from discovering a parent project's package.json and .npmrc.
+    (work_dir / "package.json").write_text(
+        json.dumps({"name": "artifact-keeper-npm-seed", "private": True}) + "\n",
+        encoding="utf-8",
+    )
     pack_dir.mkdir(parents=True, exist_ok=True)
 
-    # Isolated npm cache
-    shutil.rmtree(cache_dir, ignore_errors=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    shutil.rmtree(resolution_dir, ignore_errors=True)
-
     env = npm_environment(args.ca_bundle)
+    global_config = work_dir / "global.npmrc"
+    global_config.write_text("", encoding="utf-8")
+    env["NPM_CONFIG_GLOBALCONFIG"] = str(global_config)
 
     ssl_context = create_ssl_context(args.ca_bundle)
 
@@ -615,7 +843,7 @@ def main():
             env,
         )
 
-        dependencies = load_dependencies(package_lock)
+        dependencies = load_dependencies(package_lock, args.public_registry)
 
     except Exception as exc:
         print(
@@ -638,7 +866,9 @@ def main():
     failed = 0
 
     try:
-        for name, version in dependencies:
+        for dependency in dependencies:
+            name = dependency["name"]
+            version = dependency["version"]
             spec = f"{name}@{version}"
 
             print("-" * 60)
@@ -672,7 +902,7 @@ def main():
             try:
                 tarball = npm_pack(
                     npm,
-                    spec,
+                    dependency["resolved"] or spec,
                     args.public_registry,
                     pack_dir,
                     cache_dir,
@@ -690,6 +920,8 @@ def main():
             print("Uploading to Artifact Keeper...")
 
             try:
+                verify_tarball(tarball, dependency)
+
                 npm_publish(
                     npm,
                     tarball,
@@ -698,6 +930,8 @@ def main():
                     cache_dir,
                     env,
                     args.npm_timeout,
+                    args.publish_tag,
+                    name,
                 )
 
                 print(f"UPLOADED: {spec}")
@@ -730,4 +964,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
