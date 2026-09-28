@@ -9,10 +9,12 @@ import lzma
 import tempfile
 import threading
 import unittest
+import urllib.parse
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 SPEC = importlib.util.spec_from_file_location("seed_p2", Path(__file__).with_name("seed-p2.py"))
@@ -28,6 +30,7 @@ class SeederTests(unittest.TestCase):
         self.remote = {}
         self.puts = []
         self.fail_path = None
+        self.throttle_puts = 0
         test = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -35,7 +38,15 @@ class SeederTests(unittest.TestCase):
                 pass
 
             def do_GET(self):
-                if self.path == "/api/v1/repositories/p2":
+                parsed = urllib.parse.urlsplit(self.path)
+                if parsed.path == "/api/v1/repositories/p2/artifacts":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    page = int(query.get("page", ["1"])[0])
+                    prefix = query.get("path_prefix", [""])[0]
+                    items = [{"path": key, "checksum_sha256": hashlib.sha256(value).hexdigest()} for key, value in sorted(test.remote.items()) if key.startswith(prefix)]
+                    # Small pages exercise the pagination path on repeat uploads.
+                    body = json.dumps({"items": items[(page - 1) * 2:page * 2], "has_more": page * 2 < len(items)}).encode()
+                elif self.path == "/api/v1/repositories/p2":
                     body = json.dumps({"format": "generic", "repo_type": "local", "versioning_enabled": True}).encode()
                 else:
                     key = self.path.split("/download/", 1)[-1]
@@ -51,6 +62,13 @@ class SeederTests(unittest.TestCase):
             def do_PUT(self):
                 key = self.path.split("/artifacts/", 1)[-1]
                 body = self.rfile.read(int(self.headers["Content-Length"]))
+                if test.throttle_puts:
+                    test.throttle_puts -= 1
+                    self.send_response(429)
+                    self.send_header("Retry-After", "2")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 if key == test.fail_path:
                     self.send_error(500)
                     return
@@ -99,6 +117,20 @@ class SeederTests(unittest.TestCase):
             (self.site / name).write_bytes(b"updated metadata")
         self.assertEqual(self.upload(), 0)
         self.assertEqual(self.puts, ["releases/1.0/" + name for name in [plugin.as_posix(), *SEED.METADATA_FILES[:-1]]])
+
+    def test_rate_limit_retry_resends_complete_upload(self):
+        self.throttle_puts = 1
+        with patch.object(SEED.time, "sleep") as sleep:
+            self.assertEqual(self.upload(), 0)
+        sleep.assert_called_once_with(2)
+        self.assertEqual(self.remote["releases/1.0/plugins/example_1.0.0.jar"], (self.site / self.paths[0]).read_bytes())
+
+    def test_persistent_rate_limit_stops_after_four_retries(self):
+        self.throttle_puts = 10
+        with patch.object(SEED.time, "sleep") as sleep:
+            self.assertEqual(self.upload(), 1)
+        self.assertEqual(sleep.call_count, 4)
+        self.assertEqual(self.puts, [])
 
     def test_changed_published_jar_aborts_before_any_upload(self):
         self.remote["releases/1.0/plugins/example_1.0.0.jar"] = b"other bytes"

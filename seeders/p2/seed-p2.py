@@ -10,7 +10,7 @@ Example:
         --eclipse /path/to/eclipse --generate-only
 
 For uploading, set ARTIFACT_KEEPER_TOKEN and:
-    AK_API=https://localhost/api/v1/repositories/p2
+    AK_API=https://localhost/api/v1/repositories/p2-generic
 Use a local Generic repository with artifact versioning enabled. The Eclipse
 update-site URL is AK_API/download/ (optionally followed by --site-path).
 
@@ -35,12 +35,14 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 
@@ -232,13 +234,33 @@ def generate_site(args, executable: Path, work: Path):
 
 def request(opener, url, token, timeout, *, method="GET", path=None):
     headers = {"Authorization": f"Bearer {token}"}
-    if path is None:
-        return opener.open(urllib.request.Request(url, headers=headers, method=method), timeout=timeout)
-    content_type = "application/x-xz" if path.name.endswith(".xz") else "text/plain" if path.name == "p2.index" else "application/java-archive"
-    headers.update({"Content-Type": content_type, "Content-Length": str(path.stat().st_size), "X-Checksum-Sha256": sha256(path)})
-    with path.open("rb") as stream:
-        response = opener.open(urllib.request.Request(url, data=stream, headers=headers, method=method), timeout=timeout)
-    return response
+    if path is not None:
+        content_type = "application/x-xz" if path.name.endswith(".xz") else "text/plain" if path.name == "p2.index" else "application/java-archive"
+        headers.update({"Content-Type": content_type, "Content-Length": str(path.stat().st_size), "X-Checksum-Sha256": sha256(path)})
+    for attempt in range(5):
+        try:
+            if path is None:
+                return opener.open(urllib.request.Request(url, headers=headers, method=method), timeout=timeout)
+            # Reopen the file for each attempt so retries send the complete body.
+            with path.open("rb") as stream:
+                return opener.open(urllib.request.Request(url, data=stream, headers=headers, method=method), timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 or attempt == 4:
+                raise
+            retry_after = exc.headers.get("Retry-After", "")
+            exc.close()
+            try:
+                delay = float(int(retry_after))
+            except ValueError:
+                try:
+                    delay = parsedate_to_datetime(retry_after).timestamp() - time.time()
+                except (ValueError, TypeError, OverflowError):
+                    delay = 2 ** (attempt + 1)
+            delay = max(1, delay)
+            if delay > 300:
+                raise RuntimeError(f"Server requested a {delay:.0f}s wait; retry publication later") from exc
+            print(f"Rate limited; retrying in {delay:.0f}s ({attempt + 1}/4)", flush=True)
+            time.sleep(delay)
 
 
 def remote_digest(opener, url, token, timeout):
@@ -255,6 +277,41 @@ def remote_digest(opener, url, token, timeout):
         raise RuntimeError(f"HTTP {exc.code} checking {url}") from exc
 
 
+def remote_inventory(opener, args, token, prefix):
+    inventory = {}
+    page = 1
+    cursor = None
+    seen_cursors = set()
+    while True:
+        query = {"per_page": 100, "page": page}
+        if prefix:
+            query["path_prefix"] = prefix
+        if cursor:
+            query["cursor"] = cursor
+        url = args.artifact_keeper + "/artifacts?" + urllib.parse.urlencode(query)
+        with request(opener, url, token, args.http_timeout) as response:
+            result = json.load(response)
+        if not isinstance(result, dict) or not isinstance(result.get("items"), list):
+            raise RuntimeError("Invalid repository artifact inventory response")
+        for item in result["items"]:
+            path = item.get("path")
+            digest = item.get("checksum_sha256")
+            if not isinstance(path, str) or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+                raise RuntimeError("Repository inventory is missing a valid path or SHA-256")
+            inventory[path] = digest.lower()
+        more = result.get("has_more")
+        if more is None:
+            more = page < result.get("pagination", {}).get("total_pages", page)
+        if not more:
+            return inventory
+        cursor = result.get("next_cursor")
+        if cursor:
+            if cursor in seen_cursors:
+                raise RuntimeError("Repository inventory repeated its pagination cursor")
+            seen_cursors.add(cursor)
+        page += 1
+
+
 def upload_site(args, paths, token):
     opener = urllib.request.build_opener(NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=str(args.ca_bundle))))
     with request(opener, args.artifact_keeper, token, args.http_timeout) as response:
@@ -264,11 +321,12 @@ def upload_site(args, paths, token):
 
     prefix = args.site_path + "/" if args.site_path else ""
     print("==> Checking existing artifacts")
+    inventory = remote_inventory(opener, args, token, prefix)
     plan = []
     for relative in paths:
         encoded = urllib.parse.quote(prefix + relative.as_posix(), safe="/")
         local = args.output_dir / relative
-        existing = remote_digest(opener, args.artifact_keeper + "/download/" + encoded, token, args.http_timeout)
+        existing = inventory.get(prefix + relative.as_posix())
         same = existing == sha256(local)
         if existing and not same and relative.parts[0] in ("features", "plugins"):
             raise RuntimeError(f"Existing JAR differs: {relative}. Increment the bundle/feature version instead of replacing it.")

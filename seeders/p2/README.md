@@ -60,7 +60,7 @@ Create the repository described above, then set:
 
 ```bash
 export ARTIFACT_KEEPER_TOKEN='<token with repository read/write access>'
-export AK_API=https://localhost/api/v1/repositories/p2
+export AK_API=https://localhost/api/v1/repositories/p2-generic
 export ECLIPSE=/home/seb/eclipse/java-2026-06/eclipse/eclipse
 
 python3 seeders/p2/seed-p2.py \
@@ -76,16 +76,16 @@ For HTTPS, Python uses `/etc/ssl/certs/ca-certificates.crt` by default. Use `--c
 The Eclipse update-site URL is:
 
 ```text
-https://localhost/api/v1/repositories/p2/download/
+https://localhost/api/v1/repositories/p2-generic/download/
 ```
 
 Optional `--site-path releases/1.0` places the entire site under that prefix and makes the update URL:
 
 ```text
-https://localhost/api/v1/repositories/p2/download/releases/1.0/
+https://localhost/api/v1/repositories/p2-generic/download/releases/1.0/
 ```
 
-The script prints per-file results and the same `Total`, `Uploaded`, `Skipped`, `Failed` summary as the other seeders. It downloads remote files to compare SHA-256, so checks require read access and consume bandwidth. Uploaded bytes are downloaded again for verification. On upload failure it withholds remaining files and exits nonzero; `Failed` includes those withheld files.
+The script prints per-file results and the same `Total`, `Uploaded`, `Skipped`, `Failed` summary as the other seeders. It reads the paginated repository inventory to compare SHA-256 without downloading unchanged files; checks require repository read access. Uploaded bytes are downloaded again for verification. HTTP 429 responses are retried up to four times per request, honoring `Retry-After` (up to 300 seconds per wait); other failures stop publication. On upload failure it withholds remaining files and exits nonzero; `Failed` includes those withheld files.
 
 ## Add or update a plugin
 
