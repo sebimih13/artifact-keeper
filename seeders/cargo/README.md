@@ -123,9 +123,11 @@ Failed:   0
 
 A run containing only skips exits **0**. Actual validation, resolution, authentication, checksum or upload failures exit **1**. HTTP 429 responses handled by Python honor numeric `Retry-After` values with bounded retries; errors from Cargo itself retain Cargo's own retry behavior.
 
-## Consumer configuration: read through the virtual repository
+## Consumer configuration: keep external dependencies unchanged
 
-Use this in the consumer project's `.cargo/config.toml`:
+**Your external dependency declarations in `Cargo.toml` can remain unchanged.** Configure source replacement once on each VM in `~/.cargo/config.toml` (or `$CARGO_HOME/config.toml` if you use a custom Cargo home). Merge the following with any existing configuration:
+
+To apply this only to one project, use that project's `.cargo/config.toml` instead:
 
 ```toml
 [source.crates-io]
@@ -146,10 +148,27 @@ The `sparse+` prefix and trailing `/` matter. Standard public dependencies retai
 ```toml
 [dependencies]
 serde = "1"
+serde_json = "1"
 your-internal-crate = { version = "0.1", registry = "cargo" }
 ```
 
-Do not pretend that private packages exist on crates.io by omitting their `registry` field. In this setup the virtual URL serves both origins, but their logical Cargo source identities remain distinct.
+Only private dependencies need `registry = "cargo"`. Existing external version requirements, features and renamed dependencies can remain unchanged.
+
+The spelling is **`crates-io`**, plural. `replace-with = "cargo"` directs crates.io dependency requests **to Artifact Keeper**, not to the Internet. Missing mirrored packages cause an error; Cargo does **not** fall back to crates.io for this replaced source. Git dependencies and dependencies explicitly naming other registries are outside this replacement.
+
+With user-wide configuration, individual projects need no registry configuration file unless they override these settings. Replace `localhost` with the Artifact Keeper VM's reachable hostname when the client runs on another machine.
+
+External packages retain their crates.io source identities in `Cargo.lock`. Those URLs do not mean Cargo downloads from the Internet: source replacement supplies the identical archives from Artifact Keeper. Keep an existing crates.io lockfile and use `--locked` when its versions are mirrored with matching checksums. If migrating from explicit `registry = "cargo"` declarations on external dependencies, remove those fields and deliberately regenerate the lockfile once because the logical source identities change. Keep the registry field on private crates.
+
+An environment variable can override the named registry's URL:
+
+```bash
+export CARGO_REGISTRIES_CARGO_INDEX='sparse+https://localhost/cargo/cargo/'
+```
+
+**This variable alone is not enough to redirect ordinary external dependencies.** Keep `[source.crates-io] replace-with = "cargo"` in Cargo configuration. With that rule, public dependencies stay unchanged and use the exported URL. Add the export to your shell profile if you want it to persist; Cargo does not interpolate `${VARIABLE}` inside TOML. `CARGO_REGISTRY_DEFAULT=cargo` also does not replace crates.io dependency routing.
+
+Run external seeding on the Internet-connected staging machine. You can pass the unchanged project's `Cargo.toml` to `--toml-file`; publish any private dependencies first so Cargo can resolve them. The seeder deliberately isolates Cargo configuration to fetch upstream crates instead of reading them back from the mirror. Its destination is configured with `AK_API`/`--artifact-keeper`, independently of consumer environment overrides.
 
 Run Cargo **from the consumer project directory** so its `.cargo/config.toml` is discovered. If local TLS trust is needed, set `CARGO_HTTP_CAINFO` to a trusted PEM bundle. For private virtual repositories, also set `CARGO_REGISTRIES_CARGO_TOKEN`; use `CARGO_REGISTRIES_CARGO_INTERNAL_TOKEN` for direct `cargo publish`. The seeder sets registry-specific credential environment variables itself and never writes tokens into configuration files.
 
