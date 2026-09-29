@@ -1,0 +1,13 @@
+# Run Cargo from this directory so this configuration is discovered.
+# Public crates retain their crates.io identity/checksum but are fetched locally.
+[source.crates-io]
+replace-with = "cargo"
+
+[registries.cargo]
+index = "sparse+https://localhost/cargo/cargo/"
+
+[registries.cargo-internal]
+index = "sparse+https://localhost/cargo/cargo-internal/"
+
+[registry]
+global-credential-providers = ["cargo:token"]

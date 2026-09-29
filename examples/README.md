@@ -141,3 +141,8 @@ In ~/.m2/settings.xml, add a <server> entry whose id matches the repository id a
 
 
 
+
+# Cargo Registry
+
+See [rust-proj](rust-proj/README.md) for publishing an internal crate, mirroring
+crates.io dependencies, and consuming both through the virtual Cargo repository.

@@ -1,0 +1,9 @@
+[package]
+name = "ak-example-greeter"
+version = "0.1.0"
+edition = "2021"
+description = "Small internal crate for validating Artifact Keeper Cargo publishing"
+license = "MIT"
+publish = ["cargo-internal"]
+
+[workspace]
