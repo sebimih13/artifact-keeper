@@ -1,5 +1,7 @@
 # Mirror Eclipse p2 through Artifact Keeper
 
+For the runnable scripts and executed example, see [SEED-LOCAL-RUN.md](SEED-LOCAL-RUN.md).
+
 For a complete local repository seeded from the December update site, see
 [Seed a local p2 repository](SEED-LOCAL.md).
 

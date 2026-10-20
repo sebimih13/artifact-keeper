@@ -1,12 +1,14 @@
 # Seed the December 2026 update site into a local repository
 
+For the runnable scripts and executed example, see [SEED-LOCAL-RUN.md](SEED-LOCAL-RUN.md).
+
 This procedure downloads an upstream p2 update site with Eclipse Ant, then
 uploads the resulting flat site into a new **local p2 repository** in Artifact
 Keeper. It does not create a remote repository or a virtual repository, and
 it does not run `generate-composite.py`.
 
-The steps below are instructions; the December mirror and repository have
-not been created by writing this document. Run commands from the checkout root
+The steps below describe the manual procedure. The scripted execution and
+its actual results are documented separately in SEED-LOCAL-RUN.md. Run commands from the checkout root
 in one Bash session. The full mirror can take several GB and many minutes.
 
 ## 1. Check the source and choose a snapshot
