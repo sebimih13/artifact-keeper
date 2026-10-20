@@ -1,5 +1,8 @@
 # Mirror Eclipse p2 through Artifact Keeper
 
+For a complete local repository seeded from the December update site, see
+[Seed a local p2 repository](SEED-LOCAL.md).
+
 In Eclipse, open **Help → Install New Software → Add** and enter:
 
 ```text
