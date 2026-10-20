@@ -1,5 +1,9 @@
 
 # P2 Repository Update Site
+
+See [p2-mirror](p2-mirror/README.md) for the configured Eclipse remote and virtual
+repositories, composite metadata generation, Caddy routing, and Java certificate trust.
+
 ```
 egit/
 ├── 6.10.0/

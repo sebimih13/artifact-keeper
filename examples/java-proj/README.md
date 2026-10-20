@@ -1,113 +1,86 @@
-# Jackson through Artifact Keeper
+# Java project using Artifact Keeper
 
-This Java 17+ example serializes a Java record to JSON with Jackson and checks
-that deserializing it returns the original value. It uses Jackson Databind
-2.20.1, with Jackson Core 2.20.1 and Jackson Annotations 2.20 transitively.
-Requires an already installed JDK and Maven 3.9.x (verified with Maven 3.9.11).
+The existing Jackson demonstration is preserved, including its runtime dependency copy step. The extended Maven example consumes `org.apache.commons:commons-lang3:3.17.0` from `maven-external` and `example.ak:internal-greeter:1.0.0` from `maven-internal`, through the virtual `maven` repository. JUnit verifies that the application uses both libraries together. Use JDK 17+ and Maven 3.6.3+.
 
-## Registry and normal build
+Run the following commands from the Artifact Keeper checkout root. The three repositories must already exist, with both local repositories included in the virtual one. `settings.xml` mirrors every Maven dependency/plugin repository to `https://localhost/maven/maven/`; use your VM's hostname when appropriate. No public repository URL is required in the consumer POM.
 
-Artifact Keeper's Maven endpoint is `/maven/{repository-key}/`. This project's
-repository key is `maven`, so its URL is `http://localhost/maven/maven/`.
-The repository is **local**, with `upstream_url: null`; missing artifacts will
-fail instead of being fetched from Maven Central.
+## 1. Acquire and seed public dependencies
 
-Run commands from this directory. `.mvn/maven.config` selects `settings.xml`,
-whose `mirrorOf=*` sends dependency and plugin repository requests to Artifact
-Keeper. On another VM, replace `localhost` in `settings.xml` with the Artifact
-Keeper server hostname. `staging-settings.xml` is only for the explicitly
-selected internet-connected preparation step below.
+On the Internet-connected staging machine:
 
-```bash
-cd /home/seb/Developer/artifact-keeper/examples/java-proj
-mvn -B -C -Dmaven.repo.local=.m2-artifact-keeper clean package
-java -cp 'target/classes:target/dependency/*' example.Main
+```sh
+export ARTIFACT_KEEPER_TOKEN='your-write-token'
+export AK_CA_PEM='/path/to/artifact-keeper-ca.pem'
+
+python3 seeders/maven/seed-maven.py \
+  --pom-xml-file examples/java-proj/acquisition/pom.xml \
+  --maven-goal verify \
+  --artifact-keeper https://localhost/maven/maven-external \
+  --ca-bundle "$AK_CA_PEM"
 ```
 
-`-C` enables strict repository checksum checking. The executable code is also
-packaged as `target/artifact-keeper-jackson-demo-1.0.0.jar`; runtime libraries
-are copied into `target/dependency/`.
+`acquisition/pom.xml` contains only public dependencies and the same pinned build plugins. Its small test makes Maven download the JUnit test provider as well. The internal library is deliberately absent from this acquisition POM. Update it when consumer public dependencies/plugins change.
 
-Expected output:
+## 2. Trust the local HTTPS server in Java
 
-```text
-Jackson version: 2.20.1
-{"message":"Hello from Artifact Keeper","number":42}
-JSON round-trip successful
+If the CA is already trusted by your JVM, skip this step. Otherwise create a dedicated truststore for local repository builds (choose an unused path):
+
+```sh
+keytool -importcert -noprompt -alias artifact-keeper \
+  -file "$AK_CA_PEM" -keystore /tmp/ak-java-example-trust.p12 \
+  -storetype PKCS12 -storepass changeit
+export MAVEN_OPTS="${MAVEN_OPTS:-} -Djavax.net.ssl.trustStore=/tmp/ak-java-example-trust.p12 -Djavax.net.ssl.trustStorePassword=changeit"
 ```
 
-## Prepare and upload dependencies
+This dedicated truststore trusts the imported CA only. Use it for the local-only builds below; unset these JVM options before further public acquisition, or use a truststore containing both public roots and your local CA. A truststore password protects certificate-store integrity; it is not your Artifact Keeper token.
 
-This one-time preparation requires an internet-connected staging machine.
-For an air-gapped deployment, transfer `.m2-staging/` to a machine that can
-reach Artifact Keeper and run the Python upload there. The server itself
-does not need internet. Transfer the project files as well to build on VMs.
+## 3. Build the internal JAR, then upload it
 
-```bash
-cd /home/seb/Developer/artifact-keeper/examples/java-proj
+Building is a separate, explicit Maven step. Even this build obtains its plugins through the virtual repository:
 
-# Explicitly override the default settings for connected preparation only.
-mvn -B -C -s staging-settings.xml \
-  -Dmaven.repo.local=.m2-staging clean package > staging-build.log 2>&1
+```sh
+mvn -B -s examples/java-proj/settings.xml \
+  -f examples/java-proj/internal-greeter/pom.xml package
 
-# Prompts for the admin password; no credentials are stored in the project.
-python3 upload-cache.py .m2-staging > upload.log
+python3 seeders/maven/seed-maven.py \
+  --jar examples/java-proj/internal-greeter/target/internal-greeter-1.0.0.jar \
+  --pom-file examples/java-proj/internal-greeter/pom.xml \
+  --artifact-keeper https://localhost/maven/maven-internal \
+  --ca-bundle "$AK_CA_PEM"
 ```
 
-The importer creates the `maven` repository if missing, refuses a remote
-repository, and uploads only JAR and POM files using native Maven PUT requests.
-It includes the parent POMs and build-plugin dependencies resolved by this build.
-It verifies every uploaded file with SHA-256 and checks existing files without
-overwriting them. Maven's cache bookkeeping files are not uploaded. Artifact
-Keeper generates checksum responses for hosted files.
+Repeat the upload to verify `Uploaded: 0`, `Skipped: 2`, `Failed: 0` and exit status 0. Omitting `--pom-file` also works for this Maven-built JAR because it contains a unique embedded POM. The seeder never builds in `--jar` mode.
 
-The verified import contained **312 files, 36,121,171 bytes**. These cover the
-pinned `clean package` workflow; other Maven goals or new libraries may need
-additional imports.
+## 4. Validate the consumer using a fresh cache
 
-API requests are printed to `upload.log` without credentials:
+```sh
+export AK_MAVEN_TEST_CACHE="$(mktemp -d /tmp/ak-java-cache.XXXXXX)"
 
-```text
-POST /api/v1/auth/login
-GET  /api/v1/repositories/maven
-POST /api/v1/repositories                    (only when missing)
-GET  /maven/maven/<group-path>/<artifact>/<version>/<file>
-PUT  /maven/maven/<group-path>/<artifact>/<version>/<file>  (only when missing)
-GET  /maven/maven/<group-path>/<artifact>/<version>/<file>  (verification)
+mvn -B -s examples/java-proj/settings.xml \
+  -Dmaven.repo.local="$AK_MAVEN_TEST_CACHE" \
+  -f examples/java-proj/pom.xml clean verify
+
+mvn -B -o -s examples/java-proj/settings.xml \
+  -Dmaven.repo.local="$AK_MAVEN_TEST_CACHE" \
+  -f examples/java-proj/pom.xml clean verify
 ```
 
-For example, Jackson Databind is served at:
+The first build gets dependencies and plugins through Artifact Keeper only; the fresh cache prevents local artifacts from hiding missing repository files. The second build uses that cache without Maven repository network access. Both should report one passing `AppTest` and `BUILD SUCCESS`.
 
-```text
-http://localhost/maven/maven/com/fasterxml/jackson/core/jackson-databind/2.20.1/jackson-databind-2.20.1.jar
+The main application can also run with those two dependency JARs:
+
+```sh
+java -cp "examples/java-proj/target/classes:$AK_MAVEN_TEST_CACHE/example/ak/internal-greeter/1.0.0/internal-greeter-1.0.0.jar:$AK_MAVEN_TEST_CACHE/org/apache/commons/commons-lang3/3.17.0/commons-lang3-3.17.0.jar" example.App
 ```
 
-## Verification commands used
+Expected: `Hello, Java from Artifact Keeper!`
 
-The following build used a previously empty `.m2-artifact-keeper` directory:
+See the [Maven seeder README](../../seeders/maven/README.md) for profiles, custom upstreams, coordinates, TLS, duplicate behavior and coverage limits.
 
-```bash
-mvn -B -C -Dmaven.repo.local=.m2-artifact-keeper clean package \
-  > artifact-keeper-build.log 2>&1
-java -cp 'target/classes:target/dependency/*' example.Main
+The original Jackson entry point remains available after the consumer build:
 
-# After populating the cache, rebuild without any repository access.
-mvn -B -o -Dmaven.repo.local=.m2-artifact-keeper clean package \
-  > offline-build.log 2>&1
-java -cp 'target/classes:target/dependency/*' example.Main
-
-curl -fsS http://localhost/api/v1/repositories/maven
+```sh
+java -cp 'examples/java-proj/target/classes:examples/java-proj/target/dependency/*' example.Main
 ```
 
-The repository-only build log contains 312 successful downloads, all from
-Artifact Keeper. To repeat with another empty cache without deleting anything:
-
-```bash
-MAVEN_PROOF_CACHE="$(mktemp -d /tmp/ak-maven-proof.XXXXXX)"
-mvn -B -C -Dmaven.repo.local="$MAVEN_PROOF_CACHE" clean package
-java -cp 'target/classes:target/dependency/*' example.Main
-```
-
-Maven's `-o` option prevents access to Artifact Keeper too. Use it only after
-the local cache is populated; for offline VMs that can access the internal
-Artifact Keeper server, the regular build is appropriate.
+`staging-settings.xml` and the older `upload-cache.py` remain available for the previous manual-cache workflow; the new seeder is the documented acquisition/upload path.

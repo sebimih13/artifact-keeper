@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project name="artifact-keeper-p2-mirror" default="mirror">
+  <property name="source" value="https://localhost/general/p2/"/>
+  <property name="destination" location="mirror"/>
+  <target name="mirror">
+    <mkdir dir="${destination}"/>
+    <p2.mirror source="${source}" destination="file:${destination}/"
+               verbose="true" ignoreErrors="false" references="false"
+               mirrorProperties="false"/>
+  </target>
+</project>

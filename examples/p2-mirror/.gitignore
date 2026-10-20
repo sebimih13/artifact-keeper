@@ -1,0 +1,6 @@
+mirror/
+configuration/
+workspace/
+*.log
+*.jks
+__pycache__/
