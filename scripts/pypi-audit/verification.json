@@ -1,0 +1,66 @@
+{
+  "verified_at": "2026-10-28T07:25:09.632478+00:00",
+  "client_index": "http://localhost/pypi/pypi/simple/",
+  "successful_client_downloads": [
+    {
+      "filename": "certifi-2026.10.23-py3-none-any.whl",
+      "sha256": "e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1"
+    },
+    {
+      "filename": "urllib3-2.8.0-py3-none-any.whl",
+      "sha256": "0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3"
+    },
+    {
+      "filename": "idna-3.20-py3-none-any.whl",
+      "sha256": "ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c"
+    },
+    {
+      "filename": "charset_normalizer-3.5.2-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "34276fd796040bf0993ab33a369aa572e6979c7aab225a88893667ad8eac8f7a"
+    },
+    {
+      "filename": "requests-2.32.3-py3-none-any.whl",
+      "sha256": "70761cfe03c773ceb22aa2f671b4757976145175cdfca038c02654d061d6dcc6"
+    },
+    {
+      "filename": "six-1.17.0-py2.py3-none-any.whl",
+      "sha256": "4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274"
+    }
+  ],
+  "blocked_download_probes": [
+    {
+      "path": "/pypi/pypi/simple/requests/requests-2.19.1-py2.py3-none-any.whl",
+      "authenticated": false,
+      "status": 404
+    },
+    {
+      "path": "/api/v1/repositories/pypi/download/requests/2.19.1/requests-2.19.1-py2.py3-none-any.whl",
+      "authenticated": false,
+      "status": 404
+    },
+    {
+      "path": "/pypi/pypi-approved/simple/requests/",
+      "authenticated": false,
+      "status": 401
+    },
+    {
+      "path": "/pypi/pypi-staging/simple/requests/requests-2.19.1-py2.py3-none-any.whl",
+      "authenticated": false,
+      "status": 401
+    },
+    {
+      "path": "/api/v1/repositories/pypi-staging/download/requests/2.19.1/requests-2.19.1-py2.py3-none-any.whl",
+      "authenticated": true,
+      "status": 409
+    }
+  ],
+  "vulnerable_test": {
+    "package": "requests",
+    "version": "2.19.1",
+    "status": "blocked",
+    "reason": "AK scanner found high/critical vulnerabilities; Dependency-Track found high/critical or unknown-severity vulnerabilities; Dependency-Track policy violations; Missing or unapproved licenses: pkg:pypi/requests@2.19.1",
+    "dependency_track_findings": 10,
+    "dependency_track_policy_violations": 1
+  },
+  "unit_tests_passed": 11
+}

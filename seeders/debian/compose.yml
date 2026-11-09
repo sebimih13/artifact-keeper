@@ -1,0 +1,32 @@
+name: apt-devtools
+
+x-client: &client
+  image: ubuntu:24.04
+  init: true
+  volumes:
+    - ./install-client.sh:/demo/install-client.sh:ro
+    - ./upgrade-client.sh:/demo/upgrade-client.sh:ro
+    - ${APT_REPO_KEY_FILE:-../../.local/apt-local-devtools/repo-key.asc}:/demo/repo-key.asc:ro
+  environment:
+    APT_REPO_URL: ${APT_REPO_URL:-http://artifact-keeper-backend:8080/debian/apt-local-devtools}
+    APT_PACKAGE_VERSION: ${APT_PACKAGE_VERSION:-1.0.0-1}
+  command: ["sh", "-c", "sh /demo/install-client.sh && exec sleep infinity"]
+  healthcheck:
+    test: ["CMD-SHELL", "dpkg -s ak-devtools-hello ak-devtools-info >/dev/null 2>&1 && test -x /usr/bin/devtools-hello && test -x /usr/bin/devtools-info"]
+    interval: 10s
+    timeout: 5s
+    retries: 12
+    start_period: 20s
+
+services:
+  ubuntu-amd64:
+    <<: *client
+    platform: linux/amd64
+  ubuntu-arm64:
+    <<: *client
+    platform: linux/arm64
+
+networks:
+  default:
+    name: ${APT_DOCKER_NETWORK:-artifact-keeper-network}
+    external: true

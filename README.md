@@ -143,6 +143,8 @@ flowchart TD
 | **Conda** | Conda channels |
 | **OPKG** | OpenWrt, embedded Linux |
 
+See the [Debian/APT seeder guide](seeders/debian/README.md) for a signed local repository, sample amd64/arm64 packages, Ubuntu containers, and VM client configuration.
+
 ### Configuration Management
 
 | Format | Ecosystem |

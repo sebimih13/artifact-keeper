@@ -1,0 +1,34 @@
+{
+  "package": "six",
+  "version": "1.16.0",
+  "filename": "six-1.16.0-py2.py3-none-any.whl",
+  "path": "six/1.16.0/six-1.16.0-py2.py3-none-any.whl",
+  "sha256": "8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254",
+  "artifact_id": "7c496d50-3677-49d2-8eae-5ee7786984cd",
+  "approval_id": "a3de7ab2-d647-425c-95c2-52b9c220f887",
+  "approval_status": "pending",
+  "requester": "svc-pypi-manual-requester",
+  "quarantine": {
+    "artifact_id": "7c496d50-3677-49d2-8eae-5ee7786984cd",
+    "quarantine_status": "quarantined",
+    "quarantine_until": null,
+    "quarantine_reason": "Manual frontend demonstration: awaiting scans, Dependency-Track review and promotion approval",
+    "is_blocked": true
+  },
+  "scans": {
+    "items": [],
+    "total": 0
+  },
+  "staging_url": "http://localhost/repositories/pypi-staging",
+  "scan_url": "http://localhost/security/scans",
+  "approval_url": "http://localhost/approvals",
+  "dt_url": "http://localhost/security/dt-projects",
+  "promotion_gate": {
+    "artifact_id": "7c496d50-3677-49d2-8eae-5ee7786984cd",
+    "passed": false,
+    "violations": [
+      "Artifact has no completed security scan (scan state: never_scanned); a CVE severity rule requires a completed scan before auto-promotion"
+    ]
+  },
+  "public_download_status": 404
+}

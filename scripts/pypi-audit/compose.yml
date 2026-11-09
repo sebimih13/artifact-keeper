@@ -1,0 +1,67 @@
+services:
+  scanner-db:
+    image: python:3.13-slim
+    container_name: artifact-keeper-audit-scanner-db
+    user: "1001:0"
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    working_dir: /app
+    command: [python, -u, worker.py, refresh-db]
+    environment:
+      GRYPE_DB_CACHE_DIR: /scan-workspace/grype-db
+      GRYPE_DB_AUTO_UPDATE: "true"
+      GRYPE_CHECK_FOR_APP_UPDATE: "false"
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./worker.py:/app/worker.py:ro
+      - ../../.local/pypi-audit/bin/grype:/usr/local/bin/grype:ro
+      - scan-workspace:/scan-workspace
+    tmpfs:
+      - /tmp:uid=1001,gid=0,mode=1777,size=536870912
+    healthcheck:
+      test: [CMD, /usr/local/bin/grype, db, status]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    networks: [artifact-keeper]
+  worker:
+    image: python:3.13-slim
+    container_name: artifact-keeper-pypi-audit
+    user: "1000:1000"
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    working_dir: /app
+    command: [python, -u, worker.py, watch]
+    depends_on:
+      scanner-db:
+        condition: service_healthy
+    environment:
+      AK_URL: http://backend:8080
+      AK_API_TOKEN_FILE: /state/secrets/ak-api-token
+      DTRACK_URL: http://dependency-track-apiserver:8080
+      DTRACK_API_KEY_FILE: /state/secrets/dtrack-api-key
+      AUDIT_STATE: /state
+      AUDIT_REQUIRED_SCANNERS: dependency,grype
+      AUDIT_MAX_DB_AGE_DAYS: "7"
+      AUDIT_TIMEOUT_SECONDS: "600"
+      PIP_CACHE_DIR: /tmp/pip-cache
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./worker.py:/app/worker.py:ro
+      - ../../.local/pypi-audit:/state
+    tmpfs:
+      - /tmp:uid=1000,gid=1000,mode=1777,size=536870912
+    networks: [artifact-keeper]
+networks:
+  artifact-keeper:
+    external: true
+    name: artifact-keeper-network
+volumes:
+  scan-workspace:
+    external: true
+    name: artifact-keeper_scan_workspace
