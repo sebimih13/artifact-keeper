@@ -140,9 +140,9 @@ repository-property copying. The output is a regular, flat repository with
 It does not install anything into your IDE. Eclipse documents this task in
 [Ant tasks for managing repositories](https://help.eclipse.org/latest/topic/org.eclipse.platform.doc.isv/guide/p2_repositorytasks.htm).
 
-This mirrors existing p2 metadata. Do not run `seeders/p2/seed-p2.py` on the
-result: that script republishes features/bundles from scratch and is a different
-workflow, with a local Generic target and its own requirements.
+This mirrors existing p2 metadata. The result can also be uploaded with
+`seeders/p2/seed-p2.py --dir "$SITE" --artifact-keeper "$AK_BASE/api/v1/repositories/$AK_REPO"`
+using `AK_API_TOKEN`; that script preserves the built metadata.
 
 ## 5. Add discovery metadata and check the local site
 

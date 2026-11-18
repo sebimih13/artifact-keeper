@@ -1,118 +1,69 @@
-# Eclipse P2 seeder
+# Upload a local Eclipse P2 update site
 
-`seed-p2.py` generates an update site from existing feature and plugin JARs and uploads it to Artifact Keeper. It uses Eclipse's official `FeaturesAndBundlesPublisher` to interpret OSGi manifests, dependencies and feature descriptors. Python handles packaging, checksums and uploads; it does not build your plugins.
+`seed-p2.py` uploads an already built update site to a **P2 Local** repository.
+It preserves every file, including categories, dependencies and compressed
+metadata. It does not build EGit or regenerate P2 metadata. Python 3.9+ with the
+standard library is sufficient; Eclipse is not required for uploading.
 
-## Input and generated site
-
-Provide a directory like this (both subdirectories must exist):
-
-```text
-mirror/
-├── features/
-│   └── com.example.product_1.0.0.jar
-└── plugins/
-    └── com.example.plugin_1.0.0.jar
-```
-
-Feature JARs must contain `feature.xml`. Plugin JARs must be Eclipse/OSGi bundles with `META-INF/MANIFEST.MF`, including their bundle identity and version. An ordinary Java library JAR is not necessarily a valid bundle. This script accepts flat directories of JARs, not unpacked bundles or features. Either directory may be empty, but the site must contain at least one artifact.
-
-The separate output directory contains:
-
-```text
-site/
-├── features/             # Published feature JARs
-├── plugins/              # Published bundle JARs
-├── artifacts.jar         # ZIP containing artifacts.xml: artifact locations/checksums
-├── artifacts.xml.xz      # XZ-compressed artifacts.xml
-├── content.jar           # ZIP containing content.xml: installable units/dependencies
-├── content.xml.xz        # XZ-compressed content.xml
-└── p2.index              # Repository discovery and preferred metadata formats
-```
-
-JAR and XZ files contain equivalent XML. The index prefers XZ and allows the standard XML/JAR factory as fallback. `site.xml` is not needed for a modern P2 repository.
-
-## Requirements
-
-- Python 3.9+ with its standard library, including `lzma`; no pip packages.
-- An Eclipse installation containing `org.eclipse.equinox.p2.publisher` and `org.eclipse.equinox.p2.publisher.eclipse`, plus its supported Java runtime. Supply the installation's actual Eclipse launcher, not a wrapper script. The seeder uses temporary configuration and workspace directories.
-- For uploads: a **local Generic repository** in Artifact Keeper with **artifact versioning enabled** and a token allowed to read/write it. Versioning permits replacing the metadata at stable paths. The script keeps versioned plugin/feature JAR paths immutable.
-
-This uses Artifact Keeper's raw artifact API to serve a static P2 site. Select **Generic**, not the native P2 format: the current P2 path parser does not accept every required compressed metadata/index filename.
-
-## Generate locally
-
-Run from the project root, using your existing mirror:
+Create a local repository with format `p2` in Artifact Keeper, then run:
 
 ```bash
-export ECLIPSE=/home/seb/eclipse/committers-2026-06/eclipse/eclipse
-
+export AK_API_TOKEN='<token with repository read/write access>'
 python3 seeders/p2/seed-p2.py \
-  --source-dir seeders/p2/mirror \
-  --output-dir /tmp/artifact-keeper-p2-site \
-  --generate-only
+  --dir ~/Developer/egit/org.eclipse.egit.repository/target/repository \
+  --artifact-keeper https://localhost/api/v1/repositories/egit-local
 ```
 
-`--project-dir` is an alias for `--source-dir`. Source and output must not overlap. Keep the same output directory between runs to preserve unchanged metadata timestamps and avoid unnecessary uploads. Existing unrelated output files are not deleted; only files from the current generation are uploaded.
+Only `--dir` and `--artifact-keeper` are required. The URL must be the full
+repository API URL, without `/download/`. `ARTIFACT_KEEPER_TOKEN` is accepted
+as a fallback for existing environments.
 
-## Upload to Artifact Keeper
+The directory must contain `content` and `artifacts` metadata in `.jar`, `.xml`
+or `.xml.xz` form. All files below it are uploaded with their relative paths;
+symlinks are rejected. Supply only the built update-site directory, not the
+project source tree or a directory containing private build files.
 
-Create the repository described above, then set:
+The uploader uses the chunked upload API and supplies bundle/feature names and
+versions from `plugins/<id>_<version>.jar` and `features/<id>_<version>.jar`, so
+they appear correctly in Artifact Keeper's package list. It compares remote
+SHA-256 checksums to skip unchanged files, rejects changes to published bundle
+or feature JARs, and uploads payloads before metadata, with `p2.index` last.
+Each upload's checksum and downloaded bytes are verified. Rate limits are
+retried up to four times; other errors stop remaining uploads and exit nonzero.
 
-```bash
-export ARTIFACT_KEEPER_TOKEN='<token with repository read/write access>'
-export AK_API=https://localhost/api/v1/repositories/p2-generic
-export ECLIPSE=/home/seb/eclipse/committers-2026-06/eclipse/eclipse
-
-python3 seeders/p2/seed-p2.py \
-  --source-dir seeders/p2/mirror \
-  --output-dir /tmp/artifact-keeper-p2-site \
-  --ca-bundle /path/to/local-ca-bundle.pem
-```
-
-`AK_API` is the repository API URL, **not** `/npm/npm`, `/p2/p2`, or the update-site URL. `--artifact-keeper` overrides it. `ECLIPSE` can instead be supplied as `--eclipse`; otherwise `eclipse` is looked up on PATH. No environment variables are needed for generation if `--eclipse` is provided.
-
-For HTTPS, Python uses `/etc/ssl/certs/ca-certificates.crt` by default. Use `--ca-bundle` with a PEM trust bundle containing your local Caddy CA if that CA is not installed in the system bundle. Certificate verification stays enabled.
-
-The Eclipse update-site URL is:
+Use the printed update-site URL in Eclipse's **Help → Install New Software…**:
 
 ```text
-https://localhost/api/v1/repositories/p2-generic/download/
+https://localhost/api/v1/repositories/egit-local/download/
 ```
 
-Optional `--site-path releases/1.0` places the entire site under that prefix and makes the update URL:
+For a private repository, Eclipse needs its own authentication. The script's
+token is not passed to Eclipse. Dependencies outside the site must be available
+through the appropriate Eclipse update sites.
 
-```text
-https://localhost/api/v1/repositories/p2-generic/download/releases/1.0/
-```
+## TLS
 
-The script prints per-file results and the same `Total`, `Uploaded`, `Skipped`, `Failed` summary as the other seeders. It reads the paginated repository inventory to compare SHA-256 without downloading unchanged files; checks require repository read access. Uploaded bytes are downloaded again for verification. HTTP 429 responses are retried up to four times per request, honoring `Retry-After` (up to 300 seconds per wait); other failures stop publication. On upload failure it withholds remaining files and exits nonzero; `Failed` includes those withheld files.
-
-## Add or update a plugin
-
-1. Add the new bundle JAR under `plugins/`.
-2. For changed bundle contents, increment `Bundle-Version` and use a new versioned filename. Never replace the bytes of an already published version.
-3. If a feature should install that plugin, update its `feature.xml` references and publish a new version of the feature JAR too.
-4. Rerun the same command with the complete input directory.
-
-The seeder uploads new JARs first, then changed artifact metadata, changed content metadata, and finally `p2.index`. Unchanged files are skipped, including `p2.index` when its discovery settings have not changed. It checks for conflicting existing JARs before uploading anything. The publisher must copy every input JAR unchanged; skipped invalid bundles or duplicate identities cause generation to fail before upload.
-
-**Keep all versions you want advertised in the input.** Each run rebuilds metadata from the complete current input, not from the existing remote site. Removing an input removes it from generated metadata, but does not delete the remote JAR. The script does not resolve/download missing dependencies or validate that every feature can install into every Eclipse version. Update-site references embedded in feature descriptors are preserved by the publisher, so a mirrored feature can still reference its upstream update sites.
-
-Serialize publishing runs. Replacing several metadata files is **not atomic**; clients can briefly observe different generations, and an interrupted update may leave mixed metadata. Rerun to finish a failed publication. For releases that require consistent snapshots, publish under a new immutable `--site-path` and manage a composite repository/release switch separately; this script does not generate composite metadata.
-
-## Install in Eclipse
-
-In **Help → Install New Software… → Add…**, enter the update-site URL. Features are the usual user-facing install choices; bundles alone are primarily dependency units. This seeder does not generate categories, so uncheck **Group items by category** to see uncategorized features. For curated categories, add a separate Eclipse CategoryPublisher step before publication; do not hand-edit generated XML.
-
-Enable the additional update sites needed to resolve dependencies, or include those dependencies in your input if the site must work offline. Eclipse must trust your server certificate in its Java trust store; Python's `--ca-bundle` does not configure Eclipse. Private repositories also require client authentication through a method supported by your Eclipse installation/server, or anonymous read access. The seeder's `ARTIFACT_KEEPER_TOKEN` is not automatically passed to Eclipse clients. Do not put tokens into update-site URLs.
-
-For all command options:
+Certificate verification uses Python's system trust store. For a local CA,
+set `SSL_CERT_FILE` once in your environment, or supply `--ca-bundle <PEM>`.
+On this workstation the current local Caddy CA is available at:
 
 ```bash
-python3 seeders/p2/seed-p2.py --help
+export SSL_CERT_FILE="$PWD/.local/p2-caddy-current-root.crt"
 ```
 
-References: [Eclipse P2 publisher](https://help.eclipse.org/latest/topic/org.eclipse.platform.doc.isv/guide/p2_publisher.html), [P2 repository index](https://wiki.eclipse.org/Equinox/p2/p2_index).
+Eclipse needs that CA in its Java trust store as well. This workstation uses
+`.local/eclipse-cacerts`; Python's CA settings do not configure Java.
+
+## Updating a site
+
+Rebuild locally and rerun the same command. Changed plugin/feature contents
+must have new versions. Remote files absent from the local build are not
+deleted. Publish the complete site whose metadata you want clients to see.
+
+Serialize writers: replacing multiple metadata files is not atomic, so clients
+can briefly see mixed generations during an update. Use a separate repository
+for an immutable release if that matters. Composite sites and nonstandard
+artifact mappings are not validated or resolved by this uploader.
 
 ## Tests
 
@@ -120,24 +71,6 @@ References: [Eclipse P2 publisher](https://help.eclipse.org/latest/topic/org.ecl
 python3 -m unittest discover -s seeders/p2 -p 'test_*.py'
 ```
 
-These tests use a temporary HTTP server to check upload order, repeat-run skips, new-plugin publication, conflicting JAR rejection and failure handling. They also verify XML preservation and timestamp reuse. They do not require Eclipse or a running Artifact Keeper server; a real publisher run is exercised separately using `--generate-only`.
-
-## Troubleshooting Eclipse HTTPS access
-
-`PKIX path building failed` means the Java runtime used by Eclipse cannot validate the server certificate. Python's `--ca-bundle` does not configure Java. Use the current Caddy root CA from the running container and a dedicated Java trust store containing the normal public roots plus that CA. A recreated Caddy data volume can change the CA; a replacement Eclipse installation can also lose custom JVM settings.
-
-On this workstation, the dedicated trust store is `/home/seb/Developer/artifact-keeper/.local/eclipse-cacerts`. The current Committers installation is configured with this line **after `-vmargs`** in its `eclipse.ini`:
-
-```ini
--Djavax.net.ssl.trustStore=/home/seb/Developer/artifact-keeper/.local/eclipse-cacerts
-```
-
-Restart Eclipse after changing the trust store or JVM settings. Other installations need their own configuration. Certificate verification remains enabled.
-
-Under **Preferences → Install/Update → Available Software Sites**, remove incorrect entries ending in `content.xml.xz` or the repository API root. Keep the complete update-site directory URL:
-
-```text
-https://localhost/api/v1/repositories/p2-generic/download/
-```
-
-Do not enter an individual metadata filename as the site location. Eclipse appends the filenames itself. An error mentioning `content.xml.xz/content.xml` can result from entering the XZ file as the repository location.
+Tests use a temporary HTTP server to exercise the two-argument CLI, chunked
+uploads, package coordinates, repeat-run skips, immutable JARs, upload order,
+rate-limit retries, failure handling, metadata preservation and symlink rejection.
